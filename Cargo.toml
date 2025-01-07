@@ -1,0 +1,10 @@
+[package]
+name = "embedded-config"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.embedded-config]
+path = "embedded_config.toml"
+
+[dependencies]
+embedded-config-macro = { git = "https://github.com/killerfoxi/embedded-config-macro.git" }
