@@ -7,4 +7,4 @@ edition = "2021"
 path = "embedded_config.toml"
 
 [dependencies]
-embedded-config-macro = { git = "https://github.com/killerfoxi/embedded-config-macro.git" }
+embedded-config-macro = { path = "macro" }

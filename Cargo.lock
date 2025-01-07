@@ -12,7 +12,6 @@ dependencies = [
 [[package]]
 name = "embedded-config-macro"
 version = "0.1.0"
-source = "git+https://github.com/killerfoxi/embedded-config-macro.git#5043ef7355e5e2b7b1d37e1a500d7f5479e4b43b"
 dependencies = [
  "proc-macro2",
  "quote",
