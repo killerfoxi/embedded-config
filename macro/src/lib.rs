@@ -17,12 +17,29 @@ pub fn embed_config_value(input: proc_macro::TokenStream) -> proc_macro::TokenSt
         .into()
 }
 
+#[proc_macro]
+pub fn embed_config_value_opt(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let name = parse_macro_input!(input as LitStr);
+    embed_config_value_impl_opt(name)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
 #[derive(Debug)]
 enum ConfigError {
     NotExist(PathBuf),
     LoadError(PathBuf, std::io::Error),
     InvalidEncoding(String),
     MissingField(String),
+}
+
+impl ConfigError {
+    pub fn is_missing(&self) -> bool {
+        if let Self::MissingField(_) = self {
+            return true;
+        }
+        false
+    }
 }
 
 impl Display for ConfigError {
@@ -158,5 +175,25 @@ fn embed_config_value_impl(name: LitStr) -> Result<TokenStream, syn::Error> {
             name.span(),
             "resulted in unsupported return type",
         )),
+    }
+}
+
+fn embed_config_value_impl_opt(name: LitStr) -> Result<TokenStream, syn::Error> {
+    use toml::Value;
+
+    let cfg = load_embed_config().map_err(|e| syn::Error::new(Span::call_site(), e.to_string()))?;
+    match cfg.resolve_field(&name.value()) {
+        Ok(val) => match val {
+            Value::Boolean(v) => Ok(quote! { Some(#v) }),
+            Value::String(v) => Ok(quote! { Some(#v) }),
+            Value::Float(v) => Ok(quote! { Some(#v) }),
+            Value::Integer(v) => Ok(quote! { Some(#v) }),
+            _ => Err(syn::Error::new(
+                name.span(),
+                "resulted in unsupported return type",
+            )),
+        },
+        Err(e) if e.is_missing() => Ok(quote! { None }),
+        Err(e) => Err(syn::Error::new(name.span(), e.to_string())),
     }
 }
