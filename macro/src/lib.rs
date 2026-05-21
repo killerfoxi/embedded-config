@@ -7,7 +7,8 @@ use std::{
 
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
-use syn::{parse_macro_input, LitStr};
+use syn::{LitStr, parse_macro_input};
+use toml::Value;
 
 #[proc_macro]
 pub fn embed_config_value(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
@@ -35,10 +36,11 @@ enum ConfigError {
 
 impl ConfigError {
     pub fn is_missing(&self) -> bool {
-        if let Self::MissingField(_) = self {
-            return true;
-        }
-        false
+        matches!(self, Self::MissingField(_))
+    }
+
+    pub fn to_syn_error(self, span: Span) -> syn::Error {
+        syn::Error::new(span, self)
     }
 }
 
@@ -59,12 +61,11 @@ impl Display for ConfigError {
 
 impl ConfigError {
     pub fn from_io_error<P: Into<PathBuf>>(path: P, err: std::io::Error) -> Self {
-        use std::io::ErrorKind;
-
-        if let ErrorKind::NotFound = err.kind() {
-            return Self::NotExist(path.into());
+        if err.kind() == std::io::ErrorKind::NotFound {
+            Self::NotExist(path.into())
+        } else {
+            Self::LoadError(path.into(), err)
         }
-        Self::LoadError(path.into(), err)
     }
 }
 
@@ -105,7 +106,10 @@ impl From<VarError> for Error {
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidConfigValue => write!(f, "package.metadata.embedded-config.path is not of type String"),
+            Self::InvalidConfigValue => write!(
+                f,
+                "package.metadata.embedded-config.path is not of type String"
+            ),
             Self::MissingConfig => write!(
                 f,
                 "Neither EMBEDDED_CONFIG_PATH nor package.metadata.embedded-config.path (in the cargo manifest) is set"
@@ -131,69 +135,64 @@ impl Config {
 
     pub fn resolve_field(&self, name: &str) -> Result<toml::Value, ConfigError> {
         name.split('.')
-            .try_fold(&self.root, |cfg, f| {
-                cfg.get(f).ok_or(ConfigError::MissingField(name.into()))
+            .try_fold(&self.root, |cfg, field| {
+                cfg.get(field)
+                    .ok_or_else(|| ConfigError::MissingField(name.into()))
             })
             .cloned()
     }
 }
 
 fn load_embed_config() -> Result<Config, Error> {
-    env::var("EMBEDDED_CONFIG_PATH")
+    let path = env::var("EMBEDDED_CONFIG_PATH")
         .map(PathBuf::from)
         .or_else(|_| {
-            let mut manifest_dir = env::var("CARGO_MANIFEST_DIR").map(PathBuf::from)?;
-            let config = {
-                let mut path = manifest_dir.clone();
-                path.push("Cargo.toml");
-                Config::from_file(path)
-            }?;
+            let manifest_dir = env::var("CARGO_MANIFEST_DIR").map(PathBuf::from)?;
+            let config = Config::from_file(manifest_dir.join("Cargo.toml"))?;
             let toml::Value::String(s) =
                 config.resolve_field("package.metadata.embedded-config.path")?
             else {
                 return Err(Error::InvalidConfigValue);
             };
-            manifest_dir.push(s);
-            Ok(manifest_dir)
-        })
-        .and_then(|config_file| Ok(Config::from_file(config_file)?))
+            Ok(manifest_dir.join(s))
+        })?;
+    Config::from_file(path).map_err(Into::into)
 }
 
-fn embed_config_value_impl(name: LitStr) -> Result<TokenStream, syn::Error> {
-    use toml::Value;
-
-    let cfg = load_embed_config().map_err(|e| syn::Error::new(Span::call_site(), e.to_string()))?;
-    let val = cfg
-        .resolve_field(&name.value())
-        .map_err(|e| syn::Error::new(name.span(), e.to_string()))?;
+fn value_to_tokens(val: &Value, span: Span) -> Result<TokenStream, syn::Error> {
     match val {
         Value::Boolean(v) => Ok(quote! { #v }),
         Value::String(v) => Ok(quote! { #v }),
         Value::Float(v) => Ok(quote! { #v }),
         Value::Integer(v) => Ok(quote! { #v }),
-        _ => Err(syn::Error::new(
-            name.span(),
-            "resulted in unsupported return type",
-        )),
+        Value::Datetime(v) => {
+            let s = v.to_string();
+            Ok(quote! { #s })
+        }
+        Value::Array(v) => {
+            let elements: Vec<_> = v
+                .iter()
+                .map(|item| value_to_tokens(item, span))
+                .collect::<Result<_, _>>()?;
+            Ok(quote! { [#(#elements),*] })
+        }
+        _ => Err(syn::Error::new(span, "unsupported TOML value type")),
     }
 }
 
-fn embed_config_value_impl_opt(name: LitStr) -> Result<TokenStream, syn::Error> {
-    use toml::Value;
+fn embed_config_value_impl(name: LitStr) -> Result<TokenStream, syn::Error> {
+    let cfg = load_embed_config().map_err(|e| syn::Error::new(Span::call_site(), e.to_string()))?;
+    let val = cfg
+        .resolve_field(&name.value())
+        .map_err(|e| e.to_syn_error(name.span()))?;
+    value_to_tokens(&val, name.span())
+}
 
+fn embed_config_value_impl_opt(name: LitStr) -> Result<TokenStream, syn::Error> {
     let cfg = load_embed_config().map_err(|e| syn::Error::new(Span::call_site(), e.to_string()))?;
     match cfg.resolve_field(&name.value()) {
-        Ok(val) => match val {
-            Value::Boolean(v) => Ok(quote! { Some(#v) }),
-            Value::String(v) => Ok(quote! { Some(#v) }),
-            Value::Float(v) => Ok(quote! { Some(#v) }),
-            Value::Integer(v) => Ok(quote! { Some(#v) }),
-            _ => Err(syn::Error::new(
-                name.span(),
-                "resulted in unsupported return type",
-            )),
-        },
+        Ok(val) => value_to_tokens(&val, name.span()).map(|tokens| quote! { Some(#tokens) }),
         Err(e) if e.is_missing() => Ok(quote! { None }),
-        Err(e) => Err(syn::Error::new(name.span(), e.to_string())),
+        Err(e) => Err(e.to_syn_error(name.span())),
     }
 }

@@ -1,2 +1,5 @@
 [hello_world_example]
 name = "Crabby"
+
+[test]
+array = ["a", "b", "c"]
